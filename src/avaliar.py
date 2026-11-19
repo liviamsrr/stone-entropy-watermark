@@ -17,14 +17,13 @@ Saídas em <rodada>/avaliacao/: respostas.csv e pass1.csv.
 """
 import argparse
 import gzip
+import hashlib
 import json
 import random
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from math import comb
 from pathlib import Path
-
-import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import comum  # noqa: E402
@@ -123,7 +122,7 @@ def avaliar_apps(itens, testes_por_id, args):
         r = execucao.executar({'solucao.py': APPS_CABECALHO + item['codigo'], 'executor.py': APPS_EXECUTOR,
                                'testes.json': json.dumps(cfg)}, ['executor.py'],
                               tempo_s=min(args.tempo_teste * max(len(ins), 1) + 10, args.tempo_max),
-                              memoria_mb=args.memoria_mb, isolamento=args.isolamento)
+                              memoria_mb=args.memoria_mb, arquivo_mb=args.arquivo_mb, isolamento=args.isolamento)
         res = _resultado_marcado(r)
         if r['tempo_esgotado']:
             return False, 'tempo_total', r['isolamento']
@@ -138,7 +137,7 @@ def avaliar_classeval(itens, tarefas, args):
     def um(item):
         prog = item['codigo'] + '\n\n\n' + tarefas[item['key']]['testes'] + '\n'
         r = execucao.executar({'prog.py': prog}, ['-m', 'unittest', 'discover', '-s', '.', '-p', 'prog.py'],
-                              tempo_s=args.tempo_max, memoria_mb=args.memoria_mb, isolamento=args.isolamento)
+                              tempo_s=args.tempo_max, memoria_mb=args.memoria_mb, arquivo_mb=args.arquivo_mb, isolamento=args.isolamento)
         if r['tempo_esgotado']:
             return False, 'tempo_total', r['isolamento']
         if r['rc'] == 0:
@@ -149,9 +148,89 @@ def avaliar_classeval(itens, tarefas, args):
         return list(ex.map(um, itens))
 
 
+EVALPLUS_GT = """
+from evalplus.data import get_human_eval_plus, get_human_eval_plus_hash
+from evalplus.evaluate import get_groundtruth
+h = get_human_eval_plus_hash()
+get_groundtruth(get_human_eval_plus(), h, [])
+print("__HASH__" + h)
+"""
+# Solução de preenchimento para tarefas sem resposta num lote (o resultado é descartado).
+EVALPLUS_VAZIA = 'pass\n'
+
+
+def _sha256(path):
+    return comum.sha256_arquivo(path) if path.exists() else None
+
+
+def cache_evalplus(conteudo, args):
+    """Ground truth do evalplus para este conjunto de tarefas, calculado uma vez.
+
+    O evalplus grava o cache em user_cache_dir("evalplus") = $XDG_CACHE_HOME/evalplus
+    (a 0.3.1 não tem variável própria para isso), em <md5 do arquivo de tarefas>.pkl. Aqui
+    XDG_CACHE_HOME = dados/evalplus_cache, gravável e persistente no workspace entre jobs.
+    Esta chamada roda só as soluções canônicas do próprio HumanEval+ (nenhum código gerado),
+    por isso recebe RLIMIT_FSIZE grande (--evalplus-cache-mb); os demais limites ficam.
+    """
+    xdg = comum.DADOS / 'evalplus_cache'
+    h = hashlib.md5(conteudo).hexdigest()
+    pkl = xdg / 'evalplus' / f'{h}.pkl'
+    selo = pkl.with_name(pkl.name + '.sha256')
+    if pkl.exists() and selo.exists() and selo.read_text().strip() == _sha256(pkl):
+        print(f'evalplus: ground truth em cache ({pkl})', flush=True)
+        return xdg, pkl, selo
+    pkl.unlink(missing_ok=True)
+    (xdg / 'evalplus').mkdir(parents=True, exist_ok=True)
+    mem = max(args.memoria_mb, args.evalplus_memoria_mb)
+    print(f'evalplus: calculando o ground truth ({h}) em {pkl.parent}', flush=True)
+    r = execucao.executar(
+        {'HumanEvalPlus.jsonl': conteudo, 'gt.py': EVALPLUS_GT}, ['gt.py'],
+        tempo_s=args.evalplus_tempo, memoria_mb=mem, arquivo_mb=args.evalplus_cache_mb,
+        isolamento=args.isolamento, montagens=[(xdg, True)],
+        env_extra={'HUMANEVAL_OVERRIDE_PATH': '{tmp}/HumanEvalPlus.jsonl', 'XDG_CACHE_HOME': str(xdg),
+                   'EVALPLUS_MAX_MEMORY_BYTES': str(mem * 2**20)})
+    if f'__HASH__{h}' not in r['stdout'] or not pkl.exists():
+        pkl.unlink(missing_ok=True)
+        raise RuntimeError(f"evalplus: ground truth não foi gerado (rc={r['rc']}, tempo_esgotado="
+                           f"{r['tempo_esgotado']}):\n{r['stderr'][-3000:]}")
+    comum.write_text_atomic(selo, _sha256(pkl) + '\n')
+    print(f'evalplus: cache com {pkl.stat().st_size / 2**20:.0f} MB', flush=True)
+    return xdg, pkl, selo
+
+
+def _rodar_lote(lote, conteudo, xdg, pkl, selo, args):
+    """Um processo do evalplus. Aqui roda o código gerado: RLIMIT_FSIZE pequeno
+    (--arquivo-mb), cache só para leitura (com bwrap) e conferido pelo sha256."""
+    if selo.read_text().strip() != _sha256(pkl):
+        raise RuntimeError(f'O cache do evalplus mudou desde que foi calculado: {pkl}. Apague-o e rode de novo.')
+    amostras = ''.join(json.dumps({'task_id': tid, 'solution': cod}) + '\n' for tid, cod in lote)
+    mem = max(args.memoria_mb, args.evalplus_memoria_mb)
+    r = execucao.executar(
+        {'HumanEvalPlus.jsonl': conteudo, 'samples.jsonl': amostras},
+        ['-m', 'evalplus.evaluate', '--dataset', 'humaneval', '--samples', 'samples.jsonl',
+         '--parallel', str(args.processos), '--i_just_wanna_run'],
+        tempo_s=args.evalplus_tempo, memoria_mb=mem, arquivo_mb=args.arquivo_mb,
+        isolamento=args.isolamento, montagens=[(xdg, False)],
+        env_extra={'HUMANEVAL_OVERRIDE_PATH': '{tmp}/HumanEvalPlus.jsonl', 'XDG_CACHE_HOME': str(xdg),
+                   'EVALPLUS_MAX_MEMORY_BYTES': str(mem * 2**20), 'TOKENIZERS_PARALLELISM': 'false'},
+        ler=['samples_eval_results.json'])
+    # Ao estourar o RLIMIT_FSIZE o arquivo fica truncado e o processo sai com erro:
+    # só vale um resultado completo de um processo que terminou bem.
+    grande = 'File too large' in r['stderr'] or 'Errno 27' in r['stderr']
+    if r['rc'] != 0 or grande or 'samples_eval_results.json' not in r['saidas']:
+        return None, grande, r
+    try:
+        return json.loads(r['saidas']['samples_eval_results.json'])['eval'], False, r
+    except (json.JSONDecodeError, KeyError):
+        return None, False, r
+
+
 def avaliar_humaneval(itens, args):
-    """Um único processo do evalplus para todas as respostas, com o conjunto reduzido às
-    tarefas presentes (o evalplus exige amostras para todas as tarefas do arquivo)."""
+    """evalplus em duas etapas: (1) ground truth em cache persistente, sem código gerado;
+    (2) avaliação das respostas em lotes. Cada lote leva até `k` respostas por tarefa e todas
+    as tarefas (as que faltam recebem uma solução vazia), para que o arquivo de tarefas e o
+    seu md5 (a chave do cache) sejam os mesmos em todos os lotes. Se o arquivo de resultados
+    estourar o limite de tamanho, o lote é refeito com k menor."""
     if not itens:
         return []
     import signal
@@ -161,28 +240,41 @@ def avaliar_humaneval(itens, args):
     ids = {it['id'] for it in itens}
     with gzip.open(comum.fetch('HumanEval+'), 'rt', encoding='utf-8') as f:
         problemas = [l for l in f if json.loads(l)['task_id'] in ids]
-    amostras = ''.join(json.dumps({'task_id': it['id'], 'solution': it['codigo']}) + '\n' for it in itens)
-    mem = max(args.memoria_mb, args.evalplus_memoria_mb)
-    r = execucao.executar(
-        {'HumanEvalPlus.jsonl': ''.join(problemas), 'samples.jsonl': amostras},
-        ['-m', 'evalplus.evaluate', '--dataset', 'humaneval', '--samples', 'samples.jsonl',
-         '--parallel', str(args.processos), '--i_just_wanna_run'],
-        tempo_s=args.evalplus_tempo, memoria_mb=mem, isolamento=args.isolamento,
-        env_extra={'HUMANEVAL_OVERRIDE_PATH': '{tmp}/HumanEvalPlus.jsonl', 'XDG_CACHE_HOME': '{tmp}/cache',
-                   'EVALPLUS_MAX_MEMORY_BYTES': str(mem * 2**20), 'TOKENIZERS_PARALLELISM': 'false'},
-        ler=['samples_eval_results.json'])
-    if 'samples_eval_results.json' not in r['saidas']:
-        raise RuntimeError(f"evalplus falhou (rc={r['rc']}, tempo_esgotado={r['tempo_esgotado']}):\n"
-                           f"{r['stderr'][-3000:]}")
-    ev = json.loads(r['saidas']['samples_eval_results.json'])['eval']
-    contador, out = {}, []
-    for it in itens:   # o evalplus devolve, por tarefa, os resultados na ordem do arquivo de amostras
-        i = contador.get(it['id'], 0)
-        contador[it['id']] = i + 1
-        res = ev[it['id']][i]
-        assert res['solution'] == it['codigo'], 'evalplus: ordem dos resultados não confere'
-        ok = res['base_status'] == 'pass' and res['plus_status'] == 'pass'
-        out.append((ok, f"base={res['base_status']} plus={res['plus_status']}", r['isolamento']))
+    conteudo = ''.join(problemas).encode('utf-8')
+    ordem = [json.loads(l)['task_id'] for l in problemas]
+    xdg, pkl, selo = cache_evalplus(conteudo, args)
+
+    por_tarefa = {tid: [] for tid in ordem}
+    for i, it in enumerate(itens):
+        por_tarefa[it['id']].append(i)
+    out = [None] * len(itens)
+    k, inicio = max(1, args.evalplus_lote), 0
+    n_max = max(len(v) for v in por_tarefa.values())
+    while inicio < n_max:
+        lote, alvo = [], []
+        for tid in ordem:
+            for i in (por_tarefa[tid][inicio:inicio + k] or [None]):
+                lote.append((tid, itens[i]['codigo'] if i is not None else EVALPLUS_VAZIA))
+                alvo.append(i)
+        ev, grande, r = _rodar_lote(lote, conteudo, xdg, pkl, selo, args)
+        if ev is None:
+            if grande and k > 1:
+                k = max(1, k // 2)
+                print(f'evalplus: resultados maiores que --arquivo-mb; repetindo com {k} resposta(s) por tarefa')
+                continue
+            raise RuntimeError(f"evalplus falhou (rc={r['rc']}, tempo_esgotado={r['tempo_esgotado']}"
+                               f"{', arquivo maior que --arquivo-mb' if grande else ''}):\n{r['stderr'][-3000:]}")
+        contador = {}
+        for (tid, cod), i in zip(lote, alvo):   # por tarefa, na ordem do arquivo de amostras
+            j = contador.get(tid, 0)
+            contador[tid] = j + 1
+            if i is None:
+                continue
+            res = ev[tid][j]
+            assert res['solution'] == cod, 'evalplus: ordem dos resultados não confere'
+            ok = res['base_status'] == 'pass' and res['plus_status'] == 'pass'
+            out[i] = (ok, f"base={res['base_status']} plus={res['plus_status']}", r['isolamento'])
+        inicio += k
     return out
 
 
@@ -203,6 +295,7 @@ def testes_apps(ids_por_split):
 
 # --------------------------------------------------------------------- main
 def main(argv=None):
+    import pandas as pd   # só aqui: as funções de avaliação usam apenas a biblioteca padrão
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument('--rodada', type=Path)
@@ -216,8 +309,13 @@ def main(argv=None):
     ap.add_argument('--tempo-teste', type=float, default=4.0, help='APPS: segundos por teste')
     ap.add_argument('--tempo-max', type=float, default=60.0, help='segundos por programa')
     ap.add_argument('--memoria-mb', type=int, default=2048)
+    ap.add_argument('--arquivo-mb', type=int, default=64,
+                    help='RLIMIT_FSIZE onde roda código gerado (inclusive o processo do evalplus)')
     ap.add_argument('--evalplus-memoria-mb', type=int, default=8192)
     ap.add_argument('--evalplus-tempo', type=float, default=7200.0)
+    ap.add_argument('--evalplus-cache-mb', type=int, default=2048,
+                    help='RLIMIT_FSIZE só da etapa que grava o ground truth (sem código gerado)')
+    ap.add_argument('--evalplus-lote', type=int, default=8, help='respostas por tarefa em cada processo do evalplus')
     ap.add_argument('--processos', type=int, default=4)
     ap.add_argument('--isolamento', choices=['auto', 'bwrap', 'nenhum'], default='auto',
                     help="auto: bwrap se funcionar, senão só subprocesso; bwrap: exige bwrap")

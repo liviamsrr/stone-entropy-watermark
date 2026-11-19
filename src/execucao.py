@@ -57,7 +57,7 @@ def _ocultar():
     return [RAIZ] + ([home] if home != Path('/') else [])
 
 
-def _bwrap_args(tmp):
+def _bwrap_args(tmp, montagens=()):
     args = ['bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc',
             '--tmpfs', '/tmp', '--unshare-all', '--die-with-parent', '--new-session']
     for p in sorted(set(_ocultar()), key=lambda p: len(p.parts)):
@@ -67,6 +67,9 @@ def _bwrap_args(tmp):
     for p in {Path(sys.prefix).resolve(), Path(sys.executable).resolve().parent}:
         if any(p.is_relative_to(o) for o in _ocultar()) and p.exists():
             args += ['--ro-bind', str(p), str(p)]
+    # Pastas pedidas explicitamente (ex.: cache do evalplus), no mesmo caminho.
+    for p, gravavel in montagens:
+        args += ['--bind' if gravavel else '--ro-bind', str(p), str(p)]
     args += ['--bind', tmp, tmp, '--chdir', tmp, '--']
     return args
 
@@ -97,24 +100,29 @@ def modo_isolamento(pedido='auto'):
 
 
 def executar(arquivos, argv, tempo_s=10.0, memoria_mb=2048, arquivo_mb=64, isolamento='auto',
-             env_extra=None, ler=(), max_saida=20000):
-    """Grava `arquivos` ({nome: texto}) num diretório temporário e roda
+             env_extra=None, ler=(), montagens=(), max_saida=20000):
+    """Grava `arquivos` ({nome: texto ou bytes}) num diretório temporário e roda
     `python -I <argv...>` lá dentro. Devolve dict com rc, stdout, stderr, tempo_esgotado,
     isolamento e `saidas` ({nome: texto} dos arquivos em `ler`, lidos antes de apagar o
-    diretório). Nunca importa nem executa o código no processo atual."""
+    diretório). Nunca importa nem executa o código no processo atual.
+
+    arquivo_mb é o RLIMIT_FSIZE de todo o processo e dos filhos (inclusive o código gerado).
+    montagens: [(pasta, gravavel)] visíveis no mesmo caminho; com bwrap, as não graváveis
+    entram só para leitura (sem bwrap, a pasta fica acessível como qualquer outra)."""
     modo = modo_isolamento(isolamento)
     tmp = tempfile.mkdtemp(prefix='stone_exec_')
     try:
         for nome, texto in arquivos.items():
             destino = Path(tmp) / nome
             destino.parent.mkdir(parents=True, exist_ok=True)
-            destino.write_text(texto, encoding='utf-8')
+            # bytes exatos (sem tradução de fim de linha): o evalplus usa o md5 do arquivo
+            destino.write_bytes(texto if isinstance(texto, bytes) else texto.encode('utf-8'))
         env = _ambiente(tmp)
         if env_extra:
             env.update({k: v.replace('{tmp}', tmp) for k, v in env_extra.items()})
         cmd = [sys.executable, '-I', *argv]
         if modo == 'bwrap':
-            cmd = _bwrap_args(tmp) + cmd
+            cmd = _bwrap_args(tmp, montagens) + cmd
         kw = dict(cwd=tmp, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if LINUX:
             kw.update(start_new_session=True, preexec_fn=_limites(memoria_mb, tempo_s + 1, arquivo_mb))
