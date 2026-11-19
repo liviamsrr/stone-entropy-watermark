@@ -1,0 +1,12 @@
+# Ambiente e segredos
+.env
+.env.*
+.venv/
+
+# Python / Jupyter
+__pycache__/
+.ipynb_checkpoints/
+
+# Dados e resultados dos experimentos
+dados/
+resultados/
