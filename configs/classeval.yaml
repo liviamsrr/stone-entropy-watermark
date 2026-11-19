@@ -1,14 +1,19 @@
 name: classeval
 model_id: Qwen/Qwen2.5-Coder-7B
-model_revision: main        # troque por um commit fixo para congelar a rodada
+model_revision: 0396a76181e127dfc13e5c5ec48a8cee09938b02
 dtype: float16
 device: cuda                # carregado com device_map={'': 0}
 gamma: 0.5
-delta: 0.5
 hash_key: 15485863
 temperature: 1.0
 top_k: 50
 seed: 0
+# Braços: sem_marca (uma vez por tarefa e amostra), stone_d<delta>, hibrido_d<delta>_t<tau>
+# (STONE só onde H > tau) e humano (referência pontuada por teacher forcing).
+arms: [sem_marca, stone, hibrido, humano]
+deltas: [0.5, 1.0]
+taus: [0.3, 0.9]
+n_samples: 1                # respostas por tarefa; --n_amostras sobrescreve
 stop_check_every: 16        # o critério de fim de função/classe é verificado a cada N tokens
 # Tokens de preenchimento (FIM) apareceram nas saídas do notebook v4 (Qwen2.5-Coder-3B);
 # recebem -inf antes da entropia, da marca e da amostragem.

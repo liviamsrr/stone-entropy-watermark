@@ -1,4 +1,4 @@
-"""Partes compartilhadas por gerar.py e baixar_dados.py.
+"""Partes compartilhadas por gerar.py, analisar.py, avaliar.py e baixar_dados.py.
 
 Este módulo usa apenas a biblioteca padrão (o YAML é importado só ao ler a
 configuração), para que baixar_dados.py rode na sessão de login sem torch.
@@ -18,8 +18,9 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 RAIZ = Path(__file__).resolve().parent.parent
-DADOS = RAIZ / 'dados'
-RESULTADOS = RAIZ / 'resultados'
+# STONE_DADOS / STONE_RESULTADOS permitem testar sem tocar nas pastas reais.
+DADOS = Path(os.environ.get('STONE_DADOS') or RAIZ / 'dados')
+RESULTADOS = Path(os.environ.get('STONE_RESULTADOS') or RAIZ / 'resultados')
 
 # Mesmas URLs (com commits fixos) e mesmos nomes de arquivo do notebook v5.
 FONTES = {
@@ -40,7 +41,7 @@ CONJUNTOS = {
     'apps': dict(rotulo='APPS', fontes=['APPS/test', 'APPS/train'], divisoes=['test', 'train']),
     'classeval': dict(rotulo='ClassEval', fontes=['ClassEval'], divisoes=['test']),
 }
-# Critério de parada por conjunto (item 4) e o motivo registrado quando ele dispara.
+# Motivo registrado quando o critério de fim dispara.
 PARADA = {'HumanEval+': 'fim_da_funcao', 'APPS': 'fim_da_funcao', 'ClassEval': 'fim_da_classe'}
 
 
@@ -83,9 +84,9 @@ def sha256_arquivo(path):
     return h.hexdigest()
 
 
-def fetch(fonte, destino=DADOS, log=print):
+def fetch(fonte, destino=None, log=print):
     """Baixa a fonte para dados/ se o arquivo ainda não existe; devolve o caminho."""
-    destino = Path(destino)
+    destino = Path(destino or DADOS)
     destino.mkdir(parents=True, exist_ok=True)
     path = destino / ARQUIVOS[fonte]
     if path.exists() and path.stat().st_size > 0:
@@ -110,14 +111,72 @@ def fetch(fonte, destino=DADOS, log=print):
             time.sleep(2 * (tentativa + 1))
 
 
+# --------------------------------------------------------------- rodadas
+def chave_inventario(nome, model_id, revision):
+    info = CONJUNTOS[nome]
+    return digest(dict(sources={f: FONTES[f] for f in info['fontes']}, model=model_id,
+                       revision=revision, schema=2))[:12]
+
+
+def localizar_rodada(rodada=None, config=None):
+    """--rodada PASTA, ou --config YAML (a única pasta resultados/<name>_*)."""
+    if rodada:
+        run = Path(rodada)
+    else:
+        nome = carregar_config(config)['name']
+        candidatas = sorted(p for p in RESULTADOS.glob(f'{nome}_*') if (p / 'config.json.gz').exists())
+        if len(candidatas) != 1:
+            raise SystemExit(f'Esperava uma pasta resultados/{nome}_*, achei {len(candidatas)}: '
+                             f'{[p.name for p in candidatas]}. Use --rodada.')
+        run = candidatas[0]
+    if not (run / 'config.json.gz').exists():
+        raise SystemExit(f'{run} não é uma pasta de rodada (falta config.json.gz).')
+    return run
+
+
+def tarefas_da_rodada(run):
+    """Tarefas (com prompt, referência e testes) do inventário em cache em dados/."""
+    cfg = read_gz(Path(run) / 'config.json.gz')
+    nomes = {n for n, info in CONJUNTOS.items() if any(f in cfg['sources'] for f in info['fontes'])}
+    tarefas = {}
+    for nome in sorted(nomes):
+        path = DADOS / f"inventario_{nome}_{chave_inventario(nome, cfg['model'], cfg['revision'])}.json.gz"
+        if not path.exists():
+            raise SystemExit(f'Inventário não encontrado: {path}. Rode gerar.py com a mesma configuração.')
+        for t in read_gz(path):
+            t['key'] = digest([t['dataset'], t['split'], t['id']])[:24]
+            tarefas[t['key']] = t
+    return cfg, tarefas
+
+
+_ARQ = re.compile(r'^(?P<key>[0-9a-f]{24})_(?:(?P<humano>humano)|(?P<braco>.+)_s(?P<amostra>\d+))\.json\.gz$')
+
+
+def respostas_da_rodada(run):
+    """Gera (key, braço, amostra, caminho) para cada checkpoint da rodada."""
+    for path in sorted(Path(run).glob('*/*/*.json.gz')):
+        m = _ARQ.match(path.name)
+        if m:
+            if m['humano']:
+                yield m['key'], 'humano', None, path
+            else:
+                yield m['key'], m['braco'], int(m['amostra']), path
+
+
 # ---------------------------------------------------------------- configuração
 PADRAO = dict(
     name='rodada', model_id='Qwen/Qwen2.5-Coder-7B', model_revision='main',
     dtype='float16', device='cuda',
-    gamma=0.5, delta=0.5, hash_key=15485863, temperature=1.0, top_k=50, seed=0,
+    gamma=0.5, hash_key=15485863, temperature=1.0, top_k=50, seed=0,
+    deltas=[0.5, 1.0],            # um braço stone e um hibrido por delta
+    taus=[0.3, 0.9],              # limiares de H do braço híbrido (e regras do detector)
+    arms=['sem_marca', 'stone', 'hibrido', 'humano'],
+    n_samples=1,                  # respostas por tarefa (--n_amostras sobrescreve)
     stop_check_every=16,
     suppress_tokens=['<|fim_prefix|>', '<|fim_middle|>', '<|fim_suffix|>'],
+    sorteio=None, sorteio_seed=None,   # padrões de --sorteio/--sorteio-seed
 )
+BRACOS_VALIDOS = {'sem_marca', 'stone', 'hibrido', 'humano'}
 
 
 def carregar_config(path):
@@ -143,13 +202,43 @@ def carregar_config(path):
         if d.get('limit') is not None and (not isinstance(d['limit'], int) or d['limit'] < 1):
             raise ValueError(f'datasets.{nome}.limit deve ser inteiro positivo ou null.')
         ds[nome] = d
-    if not (0 < cfg['gamma'] < 1 and cfg['delta'] >= 0 and cfg['top_k'] >= 1
-            and cfg['temperature'] > 0 and cfg['stop_check_every'] >= 1):
-        raise ValueError('Parâmetros fora do intervalo: 0<gamma<1, delta>=0, top_k>=1, '
-                         'temperature>0, stop_check_every>=1.')
+    if not (0 < cfg['gamma'] < 1 and cfg['top_k'] >= 1 and cfg['temperature'] > 0
+            and cfg['stop_check_every'] >= 1 and cfg['n_samples'] >= 1):
+        raise ValueError('Parâmetros fora do intervalo: 0<gamma<1, top_k>=1, temperature>0, '
+                         'stop_check_every>=1, n_samples>=1.')
+    if not cfg['deltas'] or any(d < 0 for d in cfg['deltas']) or any(t < 0 for t in cfg['taus']):
+        raise ValueError('deltas precisa de ao menos um valor >= 0; taus, valores >= 0.')
+    if 'hibrido' in cfg['arms'] and not cfg['taus']:
+        raise ValueError('O braço hibrido precisa de ao menos um tau.')
+    if set(cfg['arms']) - BRACOS_VALIDOS:
+        raise ValueError(f'arms aceita {sorted(BRACOS_VALIDOS)}.')
     if cfg['dtype'] not in {'float16', 'bfloat16', 'float32'} or cfg['device'] not in {'cuda', 'cpu'}:
         raise ValueError('dtype deve ser float16/bfloat16/float32 e device, cuda/cpu.')
+    cfg['deltas'] = [float(x) for x in cfg['deltas']]
+    cfg['taus'] = [float(x) for x in cfg['taus']]
     return cfg
+
+
+def nome_braco(tipo, delta=None, tau=None):
+    """sem_marca, humano, stone_d0.5, hibrido_d0.5_t0.9."""
+    if tipo in ('sem_marca', 'humano'):
+        return tipo
+    if tipo == 'stone':
+        return f'stone_d{float(delta)}'
+    return f'hibrido_d{float(delta)}_t{float(tau)}'
+
+
+def bracos(cfg):
+    """Braços gerados (com parâmetros), na ordem de execução. 'humano' fica à parte."""
+    out = []
+    if 'sem_marca' in cfg['arms']:
+        out.append(dict(nome='sem_marca', tipo='sem_marca', delta=0.0, tau=None))
+    if 'stone' in cfg['arms']:
+        out += [dict(nome=nome_braco('stone', d), tipo='stone', delta=d, tau=None) for d in cfg['deltas']]
+    if 'hibrido' in cfg['arms']:
+        out += [dict(nome=nome_braco('hibrido', d, t), tipo='hibrido', delta=d, tau=t)
+                for d in cfg['deltas'] for t in cfg['taus']]
+    return out
 
 
 def selecionar(grupos, cfg, inicio=None, fim=None, sorteio=None, sorteio_seed=None, limite=None):
@@ -157,7 +246,8 @@ def selecionar(grupos, cfg, inicio=None, fim=None, sorteio=None, sorteio_seed=No
 
     1. em cada (conjunto, divisão), as primeiras `limit` tarefas (YAML ou --limite);
     2. concatenação na ordem do YAML (APPS: test e depois train);
-    3. --sorteio N: amostra N tarefas com a semente, mantendo a ordem do inventário;
+    3. sorteio N (YAML ou --sorteio): amostra N tarefas com a semente, mantendo a
+       ordem do inventário;
     4. --inicio/--fim: fatia [inicio, fim) da lista resultante.
     A mesma semente dá a mesma amostra em todos os jobs, então fatias de um mesmo
     sorteio não se sobrepõem.
@@ -170,11 +260,122 @@ def selecionar(grupos, cfg, inicio=None, fim=None, sorteio=None, sorteio_seed=No
         for divisao in info['divisoes']:
             ts = grupos[info['rotulo'], divisao]
             lista.extend(ts[:lim] if lim else ts)
-    if sorteio is not None:
-        semente = cfg['seed'] if sorteio_seed is None else sorteio_seed
+    sorteio = cfg.get('sorteio') if sorteio is None else sorteio
+    if sorteio:
+        semente = sorteio_seed if sorteio_seed is not None else (
+            cfg.get('sorteio_seed') if cfg.get('sorteio_seed') is not None else cfg['seed'])
         idx = sorted(random.Random(semente).sample(range(len(lista)), min(sorteio, len(lista))))
         lista = [lista[i] for i in idx]
     return lista[inicio:fim]
+
+
+# ------------------------------------------------------------------- APPS
+def _assinatura_corpo(starter, fn):
+    """Se o starter termina na assinatura de `fn`, devolve a indentação do corpo."""
+    defs = list(re.finditer(rf'^([ \t]*)(?:async[ \t]+)?def[ \t]+{re.escape(fn)}\b', starter, re.M))
+    if not defs:
+        return None
+    base = defs[-1].group(1)
+    ind = base + ('\t' if '\t' in base else '    ')
+    try:
+        arvore = ast.parse(starter + '\n' + ind + 'pass\n')
+    except SyntaxError:
+        return None
+    alvos = [n for n in ast.walk(arvore) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fn]
+    ultimo = max((n for n in ast.walk(arvore) if hasattr(n, 'lineno')), key=lambda n: (n.lineno, n.col_offset))
+    if alvos and len(alvos[-1].body) == 1 and isinstance(alvos[-1].body[0], ast.Pass) and ultimo is alvos[-1].body[0]:
+        return ind
+    return None
+
+
+def apps_prompt(question, starter, fn):
+    """Formato de completar função, como no HumanEval+: enunciado em comentários e,
+    em seguida, o starter_code terminando na assinatura de `fn`. O modelo completa
+    só o corpo. Sem starter utilizável, o modelo escreve a função inteira ('bloco').
+    Devolve (prompt, formato, indentação do corpo)."""
+    linhas = ['# QUESTION:'] + [('# ' + l).rstrip() for l in question.strip().splitlines()]
+    cab = '\n'.join(linhas + ['#', '# Use Call-Based Format', ''])
+    st = (starter or '').rstrip()
+    ind = _assinatura_corpo(st, fn) if st else None
+    if ind is not None:
+        return cab + st + '\n', 'continuacao', ind
+    return cab, 'bloco', None
+
+
+_IMPORTS = (ast.Import, ast.ImportFrom)
+
+
+def apps_referencia(solutions, fn, prompt, formato, ind):
+    """Primeira solução válida para o mesmo prompt.
+
+    continuacao: o texto humano é tudo o que vem depois da assinatura de `fn` até o
+    fim da solução (corpo, métodos e funções seguintes). Vale a solução em que, antes
+    de `fn`, só há imports e, se `fn` é método, a linha da classe (`fn` é o primeiro
+    membro). Os imports caem; o avaliador do APPS já importa os módulos comuns.
+    A indentação do def na solução é trocada pela do starter, e prompt + texto
+    precisa compilar.
+    bloco: a solução inteira, se compilar e definir `fn`.
+    """
+    base_alvo = ind[:-1] if ind and ind.endswith('\t') else (ind[:-4] if ind else '')
+    for sol in solutions:
+        if not isinstance(sol, str) or not sol.strip():
+            continue
+        try:
+            arvore = ast.parse(sol)
+        except (SyntaxError, ValueError):
+            continue
+        alvos = [n for n in ast.walk(arvore) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fn]
+        if not alvos:
+            continue
+        if formato == 'bloco':
+            return sol if sol.endswith('\n') else sol + '\n'
+        node = alvos[0]
+        antes_ok = True
+        for n in arvore.body:
+            if n is node:
+                break
+            if isinstance(n, _IMPORTS):
+                continue
+            if isinstance(n, ast.ClassDef) and n.body and n.body[0] is node:
+                break
+            antes_ok = False
+            break
+        if not antes_ok or node.body[0].lineno == node.lineno:
+            continue
+        linhas = sol.splitlines(keepends=True)
+        sd = re.match(r'[ \t]*', linhas[node.lineno - 1]).group()
+        if (sd == '') != (base_alvo == ''):
+            continue        # método no starter e função solta na solução, ou o contrário
+        corpo = ''
+        for l in linhas[node.body[0].lineno - 1:]:
+            corpo += base_alvo + l[len(sd):] if l.startswith(sd) and l.strip() else l
+        if not corpo.endswith('\n'):
+            corpo += '\n'
+        try:
+            ast.parse(prompt + corpo)
+        except SyntaxError:
+            continue
+        return corpo
+    return None
+
+
+def apps_tarefa(d, split):
+    """Registro do APPS -> tarefa (sem comprimentos, que dependem do tokenizador)."""
+    raw = d.get('input_output') or {}
+    # Só precisamos de fn_name. Entradas dos testes podem ter inteiros de milhares de dígitos.
+    io_ = json.loads(raw, parse_int=str) if isinstance(raw, str) else raw
+    fn = (io_ or {}).get('fn_name')
+    if not fn:
+        return None
+    solutions = d.get('solutions') or []
+    if isinstance(solutions, str):
+        solutions = json.loads(solutions)
+    prompt, formato, ind = apps_prompt(d['question'], d.get('starter_code') or '', fn)
+    identifier = d['id'] if 'id' in d else d['problem_id']
+    return dict(dataset='APPS', split=split, id=str(identifier), prompt=prompt, formato=formato,
+                referencia=apps_referencia(solutions, fn, prompt, formato, ind),
+                solucoes=[s for s in solutions if isinstance(s, str) and s.strip()],
+                difficulty=d.get('difficulty') or '', target=fn)
 
 
 # ------------------------------------------------------- fronteiras (do v4)
@@ -197,7 +398,7 @@ def _top_level(item, depth):
 
 
 def fronteira_continuacao(prompt, completion):
-    """HumanEval+: lógica do notebook v4 (python_boundary).
+    """HumanEval+ e APPS (formato continuacao): lógica do notebook v4 (python_boundary).
 
     O prompt termina dentro da função; a função acaba no próximo elemento no
     nível zero de indentação, fora de parênteses, que comece depois do prompt.
@@ -228,24 +429,25 @@ _CERCA_FIM = re.compile(r'^```', re.M)
 _INICIO_CODIGO = re.compile(r'^(?:def|class|async\s+def|import|from|@)\b|^@', re.M)
 
 
-def fronteira_bloco_alvo(completion, alvo):
-    """APPS (alvo = fn_name) e ClassEval (alvo = nome da classe).
-
-    O prompt não é Python, então a completion é analisada sozinha. A mesma regra
-    do v4 é aplicada a partir do bloco de nível zero que define `alvo`
-    (`def alvo` ou `class alvo`, em qualquer profundidade; ex.: método dentro de
-    `class Solution`): a fronteira é o próximo elemento de nível zero depois dele.
-    Imports e funções auxiliares antes do alvo não encerram a geração.
-    Uma cerca de markdown (```) que abre a resposta é ignorada, e uma cerca de
-    fechamento depois do alvo também conta como fronteira.
-    """
+def inicio_codigo(completion):
+    """Posição onde o código começa: pula uma cerca ``` inicial e prosa antes do código."""
     m = _CERCA_INICIO.match(completion)
     base = m.end() if m else 0
-    # Prosa antes do código (ex.: "Here's the code:") quebraria o tokenize;
-    # a análise começa na primeira linha de código no nível zero.
     codigo = _INICIO_CODIGO.search(completion, base)
-    if codigo:
-        base = codigo.start()
+    return codigo.start() if codigo else base
+
+
+def fronteira_bloco_alvo(completion, alvo):
+    """ClassEval (alvo = classe) e APPS sem starter utilizável (alvo = fn_name).
+
+    O prompt não termina em código, então a completion é analisada sozinha. A mesma
+    regra do v4 é aplicada a partir do bloco de nível zero que define `alvo`
+    (`def alvo` ou `class alvo`, em qualquer profundidade): a fronteira é o próximo
+    elemento de nível zero depois dele. Imports e funções auxiliares antes do alvo não
+    encerram a geração. Uma cerca ``` que abre a resposta e prosa antes do código são
+    ignoradas; uma cerca de fechamento depois do alvo também conta como fronteira.
+    """
+    base = inicio_codigo(completion)
     corpo = completion[base:]
     cerca = _CERCA_FIM.search(corpo)
     trecho = corpo[:cerca.start()] if cerca else corpo
@@ -272,10 +474,29 @@ def fronteira_bloco_alvo(completion, alvo):
     return None
 
 
+def formato(task):
+    return task.get('formato') or ('continuacao' if task['dataset'] == 'HumanEval+' else 'bloco')
+
+
 def fronteira(task, completion):
-    if task['dataset'] == 'HumanEval+':
+    if formato(task) == 'continuacao':
         return fronteira_continuacao(task['prompt'], completion)
     return fronteira_bloco_alvo(completion, task['target'])
+
+
+def codigo_avaliavel(task, texto):
+    """Programa a executar/compilar a partir de um trecho de resposta."""
+    if formato(task) == 'continuacao':
+        return task['prompt'] + texto
+    return texto[inicio_codigo(texto):]
+
+
+def compila(codigo):
+    try:
+        ast.parse(codigo)
+        return True
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+        return False
 
 
 def corte(task, ids, decode, especiais):
@@ -296,11 +517,6 @@ def corte(task, ids, decode, especiais):
             elif len(prefixo) > pos:
                 break
     mantido = decode(ids[:manter])
-    codigo = task['prompt'] + mantido if task['dataset'] == 'HumanEval+' else mantido
-    try:
-        arvore = ast.parse(codigo)
-        sintaxe_ok = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                         for n in arvore.body)
-    except (SyntaxError, ValueError, TypeError):
-        sintaxe_ok = False
-    return dict(chars=pos, tokens=manter, motivo=motivo, sintaxe_ok=sintaxe_ok)
+    return dict(chars=pos, tokens=manter, motivo=motivo, texto=mantido, texto_inteira=texto,
+                ast_ok=compila(codigo_avaliavel(task, mantido)),
+                ast_ok_inteira=compila(codigo_avaliavel(task, texto)))

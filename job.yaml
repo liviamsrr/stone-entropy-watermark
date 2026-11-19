@@ -6,8 +6,7 @@ image: pytorch/pytorch:2.13.0-cuda13.0-cudnn9-devel
 gpus: 1
 # vram: VRAM mínima por GPU, em GB. Qwen2.5-Coder-7B em fp16 ocupa ~15 GB de pesos;
 # some o cache KV e os logits (~1-3 GB nas gerações deste projeto).
-# Preencha com a menor classe que atenda (veja sauron status).
-vram: PREENCHER
+vram: 20
 memory: 32g
 max_time: 1h               # suficiente para o smoke; aumente para as rodadas completas
 
@@ -17,4 +16,6 @@ workspace: stone-entropy-watermark
 # variáveis NÃO secretas, lidas pelo script.sh
 env:
   CONFIG: configs/smoke.yaml
-  ARGS: ""                 # ex.: "--sorteio 600 --inicio 0 --fim 200" para fatiar o APPS
+  ETAPAS: "gerar analisar avaliar"   # qualquer subconjunto, nesta ordem
+  ARGS: ""                 # gerar.py; ex.: "--inicio 0 --fim 200" para fatiar o APPS, "--n_amostras 5"
+  ARGS_AVALIAR: ""         # avaliar.py; ex.: "--apps-subconjunto 100 --apps-testes-max 20"
