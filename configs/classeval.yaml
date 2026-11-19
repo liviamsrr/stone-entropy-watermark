@@ -1,0 +1,19 @@
+name: classeval
+model_id: Qwen/Qwen2.5-Coder-7B
+model_revision: main        # troque por um commit fixo para congelar a rodada
+dtype: float16
+device: cuda                # carregado com device_map={'': 0}
+gamma: 0.5
+delta: 0.5
+hash_key: 15485863
+temperature: 1.0
+top_k: 50
+seed: 0
+stop_check_every: 16        # o critério de fim de função/classe é verificado a cada N tokens
+# Tokens de preenchimento (FIM) apareceram nas saídas do notebook v4 (Qwen2.5-Coder-3B);
+# recebem -inf antes da entropia, da marca e da amostragem.
+suppress_tokens: ['<|fim_prefix|>', '<|fim_middle|>', '<|fim_suffix|>']
+datasets:
+  classeval:
+    max_new_tokens: 1536    # classe de referência: p99 = 761 tokens, máx. = 826
+    limit: null             # null = todas as 100

@@ -1,0 +1,9 @@
+# Instalado num venv com --system-site-packages sobre a imagem
+# pytorch/pytorch:2.13.0-cuda13.0-cudnn9-devel. NÃO liste torch aqui: ele vem da imagem.
+# (accelerate pede torch>=2.0, que a imagem já satisfaz; o script.sh confere que o
+# torch carregado continua sendo o da imagem.)
+transformers==4.57.1
+accelerate==1.10.1          # necessário para device_map={'': 0}
+pandas>=2.2,<3
+pyarrow>=15                 # leitura do parquet do ClassEval
+pyyaml>=6

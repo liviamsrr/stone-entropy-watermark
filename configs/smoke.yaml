@@ -1,0 +1,20 @@
+# Verificação rápida: 2 tarefas por conjunto/divisão (APPS: 2 de test + 2 de train).
+name: smoke
+model_id: Qwen/Qwen2.5-Coder-7B
+model_revision: main        # troque por um commit fixo para congelar a rodada
+dtype: float16
+device: cuda                # carregado com device_map={'': 0}
+gamma: 0.5
+delta: 0.5
+hash_key: 15485863
+temperature: 1.0
+top_k: 50
+seed: 0
+stop_check_every: 8         # o critério de fim de função/classe é verificado a cada N tokens
+# Tokens de preenchimento (FIM) apareceram nas saídas do notebook v4 (Qwen2.5-Coder-3B);
+# recebem -inf antes da entropia, da marca e da amostragem.
+suppress_tokens: ['<|fim_prefix|>', '<|fim_middle|>', '<|fim_suffix|>']
+datasets:
+  humaneval: {max_new_tokens: 128, limit: 2}
+  apps:      {max_new_tokens: 128, limit: 2}
+  classeval: {max_new_tokens: 256, limit: 2}
