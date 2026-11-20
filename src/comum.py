@@ -115,7 +115,7 @@ def fetch(fonte, destino=None, log=print):
 def chave_inventario(nome, model_id, revision):
     info = CONJUNTOS[nome]
     return digest(dict(sources={f: FONTES[f] for f in info['fontes']}, model=model_id,
-                       revision=revision, schema=2))[:12]
+                       revision=revision, schema=3))[:12]   # 3: ClassEval = skeleton + reimplementação
 
 
 def localizar_rodada(rodada=None, config=None):
@@ -269,6 +269,79 @@ def selecionar(grupos, cfg, inicio=None, fim=None, sorteio=None, sorteio_seed=No
     return lista[inicio:fim]
 
 
+# --------------------------------------------------------------- ClassEval
+_ASPAS_CURVAS = re.compile('[“”]{3}')
+_ASPAS_EXTERNAS = re.compile(r"\s*'{3}\n(.*)\n'{3}\s*", re.S)
+
+
+def _fechar_docstrings(texto):
+    """Fecha uma docstring de método que ficou aberta até o próximo def/class (ClassEval_22)."""
+    out, aberta, ind = [], False, ''
+    for l in texto.split('\n'):
+        if aberta and re.match(r'[ \t]*(?:async\s+)?(?:def|class)\s', l) and len(l) - len(l.lstrip()) < len(ind):
+            while out and not out[-1].strip():
+                out.pop()
+            out += [ind + '"' * 3, '']
+            aberta = False
+        out.append(l)
+        n = l.count('"' * 3)
+        if not aberta and l.strip().startswith('"' * 3) and n == 1:
+            aberta, ind = True, l[:len(l) - len(l.lstrip())]
+        elif aberta and n:
+            aberta = False
+    return '\n'.join(out)
+
+
+def classeval_skeleton(skeleton):
+    """Corrige defeitos de digitação de 4 skeletons do ClassEval (fef204b) e devolve
+    (texto, correções). Fora isso, o skeleton fica como no conjunto:
+    - ClassEval_5: skeleton inteiro dentro de aspas simples triplas (vira uma string, sem classe);
+    - ClassEval_43 e 46: aspas curvas triplas no lugar de aspas duplas triplas;
+    - ClassEval_22: docstring de register_class sem fechamento."""
+    s, correcoes = skeleton, []
+    m = _ASPAS_EXTERNAS.fullmatch(s)
+    if m:
+        s, correcoes = m.group(1), correcoes + ['aspas_externas']
+    if _ASPAS_CURVAS.search(s):
+        s, correcoes = _ASPAS_CURVAS.sub('"' * 3, s), correcoes + ['aspas_curvas']
+    if not compila(s):
+        s2 = _fechar_docstrings(s)
+        if compila(s2):
+            s, correcoes = s2, correcoes + ['docstring_aberta']
+    return s, correcoes
+
+
+def classeval_prompt(skeleton):
+    """Formato holístico do ClassEval para modelo base (Du et al., 2023: prompt = skeleton),
+    sem nenhuma instrução em linguagem natural: imports, `class Nome:` com docstring, o
+    construtor e as assinaturas dos métodos com docstrings. O prompt termina no corpo da
+    classe, depois do último método; o modelo reescreve os métodos com corpo dentro da
+    mesma classe (em Python vale a última definição). Mesmo prompt em todos os braços.
+    Devolve (prompt, correções)."""
+    s, correcoes = classeval_skeleton(skeleton)
+    return s.rstrip() + '\n\n', correcoes
+
+
+def classeval_referencia(solution_code, class_name, prompt):
+    """Texto humano para o mesmo prompt: o corpo da classe da solution_code (construtor e
+    métodos com implementação), na indentação do skeleton (4 espaços nas 100 tarefas).
+    Código de nível zero fora da classe (imports e, no ClassEval_52, chamadas
+    nltk.download) fica de fora. None se prompt + corpo não compilar."""
+    try:
+        arvore = ast.parse(solution_code)
+    except SyntaxError:
+        return None
+    cls = next((n for n in arvore.body if isinstance(n, ast.ClassDef) and n.name == class_name), None)
+    if cls is None or not cls.body:
+        return None
+    primeiro = cls.body[0]
+    inicio = min([primeiro.lineno] + [d.lineno for d in getattr(primeiro, 'decorator_list', [])])
+    linhas = solution_code.splitlines(keepends=True)
+    corpo = ''.join(linhas[inicio - 1:cls.end_lineno])
+    corpo = corpo if corpo.endswith('\n') else corpo + '\n'
+    return corpo if compila(prompt + corpo) else None
+
+
 # ------------------------------------------------------------------- APPS
 def _assinatura_corpo(starter, fn):
     """Se o starter termina na assinatura de `fn`, devolve a indentação do corpo."""
@@ -398,10 +471,11 @@ def _top_level(item, depth):
 
 
 def fronteira_continuacao(prompt, completion):
-    """HumanEval+ e APPS (formato continuacao): lógica do notebook v4 (python_boundary).
+    """HumanEval+, APPS e ClassEval (formato continuacao): lógica do notebook v4 (python_boundary).
 
-    O prompt termina dentro da função; a função acaba no próximo elemento no
-    nível zero de indentação, fora de parênteses, que comece depois do prompt.
+    O prompt termina dentro da função (HumanEval+, APPS) ou do corpo da classe (ClassEval);
+    ela acaba no próximo elemento no nível zero de indentação, fora de parênteses, que
+    comece depois do prompt. No ClassEval isso é o fim da classe ("fim_da_classe").
     Devolve o índice (em caracteres da completion) ou None.
     """
     full = prompt + completion
@@ -438,7 +512,7 @@ def inicio_codigo(completion):
 
 
 def fronteira_bloco_alvo(completion, alvo):
-    """ClassEval (alvo = classe) e APPS sem starter utilizável (alvo = fn_name).
+    """APPS sem starter utilizável (alvo = fn_name). (Até o protocolo scripts-2, também o ClassEval.)
 
     O prompt não termina em código, então a completion é analisada sozinha. A mesma
     regra do v4 é aplicada a partir do bloco de nível zero que define `alvo`
@@ -475,7 +549,7 @@ def fronteira_bloco_alvo(completion, alvo):
 
 
 def formato(task):
-    return task.get('formato') or ('continuacao' if task['dataset'] == 'HumanEval+' else 'bloco')
+    return task.get('formato') or ('bloco' if task['dataset'] == 'APPS' else 'continuacao')
 
 
 def fronteira(task, completion):
@@ -485,10 +559,13 @@ def fronteira(task, completion):
 
 
 def codigo_avaliavel(task, texto):
-    """Programa a executar/compilar a partir de um trecho de resposta."""
-    if formato(task) == 'continuacao':
-        return task['prompt'] + texto
-    return texto[inicio_codigo(texto):]
+    """Programa a executar/compilar a partir de um trecho de resposta. No ClassEval, como
+    no avaliador oficial (test_pipeline.py), os import_statement da tarefa vêm antes:
+    alguns skeletons não trazem todos os imports que a classe usa (ex.: 39, 92)."""
+    codigo = task['prompt'] + texto if formato(task) == 'continuacao' else texto[inicio_codigo(texto):]
+    if task.get('imports'):
+        codigo = '\n'.join(task['imports']) + '\n' + codigo
+    return codigo
 
 
 def compila(codigo):

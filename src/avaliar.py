@@ -142,10 +142,26 @@ def avaliar_classeval(itens, tarefas, args):
             return False, 'tempo_total', r['isolamento']
         if r['rc'] == 0:
             return True, 'ok', r['isolamento']
-        ultima = (r['stderr'].strip().splitlines() or [''])[-1][:120]
-        return False, f"rc={r['rc']}: {ultima}", r['isolamento']
+        return False, motivo_unittest(r['stderr'], r['rc']), r['isolamento']
     with ThreadPoolExecutor(args.processos) as ex:
         return list(ex.map(um, itens))
+
+
+def motivo_unittest(stderr, rc, limite=400):
+    """Resumo do unittest + a linha final de cada traceback (o erro real), sem repetir.
+    Ex.: "FAILED (errors=2) | ModuleNotFoundError: No module named 'nltk'"."""
+    linhas = stderr.splitlines()
+    erros = []
+    for i, l in enumerate(linhas):
+        if l.startswith('Traceback (most recent call last):'):
+            for m in linhas[i + 1:]:
+                # a primeira linha sem indentação depois do traceback é a exceção
+                if m and not m[0].isspace():
+                    if m not in erros:
+                        erros.append(m.strip())
+                    break
+    resumo = next((l.strip() for l in reversed(linhas) if l.startswith(('FAILED', 'OK', 'NO TESTS RAN'))), f'rc={rc}')
+    return ' | '.join([resumo] + erros)[:limite]
 
 
 EVALPLUS_GT = """

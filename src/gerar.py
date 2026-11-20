@@ -36,7 +36,7 @@ import comum  # noqa: E402
 from comum import (CONJUNTOS, FONTES, PARADA, corte, digest, fetch, fronteira,  # noqa: E402
                    read_gz, write_gz, write_text_atomic)
 
-PROTOCOLO = 'scripts-2'   # notebook v5: 'v5.1'; scripts-1: sem híbrido/humano e APPS no formato antigo
+PROTOCOLO = 'scripts-3'   # v5.1 = notebook; scripts-1: sem híbrido/humano; scripts-2: ClassEval com instrução
 SYN = set(('True False None and as assert async await break class continue def del elif else '
            'except finally for from global if import in is lambda nonlocal not or pass raise return '
            'try while with yield int float complex str bytes bool list tuple set dict NoneType').split())
@@ -81,13 +81,17 @@ def carregar_conjunto(nome, tok, model_id, revision):
             if n != 5000:
                 raise ValueError(f'APPS {split}: esperados 5000 registros, encontrados {n}.')
     elif nome == 'classeval':
-        cols = ['task_id', 'skeleton', 'solution_code', 'class_name', 'test']
+        cols = ['task_id', 'skeleton', 'solution_code', 'class_name', 'test', 'import_statement']
         for d in pd.read_parquet(fetch('ClassEval', log=log.info), columns=cols).to_dict('records'):
-            prompt = ('Implement the complete Python class described by the following skeleton. '
-                      'Return the entire class as Python code.\n\n' + d['skeleton'] + '\n\n# Implementation\n')
+            prompt, correcoes = comum.classeval_prompt(d['skeleton'])
+            if correcoes:
+                log.info('ClassEval %s: skeleton corrigido (%s)', d['task_id'], ', '.join(correcoes))
             tasks.append(dict(dataset='ClassEval', split='test', id=d['task_id'], prompt=prompt,
-                              formato='bloco', referencia=d['solution_code'], testes=d['test'],
-                              ref_tokens=ntok(d['solution_code']), difficulty='', target=d['class_name']))
+                              formato='continuacao', correcoes_skeleton=correcoes,
+                              referencia=comum.classeval_referencia(d['solution_code'], d['class_name'], prompt),
+                              testes=d['test'], imports=list(d['import_statement']),
+                              ref_tokens=ntok(d['solution_code']), difficulty='',
+                              target=d['class_name']))
         assert len(tasks) == 100, f'ClassEval: esperadas 100, encontradas {len(tasks)}'
     write_gz(index, tasks)
     return tasks
@@ -102,7 +106,7 @@ def inventario(cfg, tok, revision):
         t['key'] = digest([t['dataset'], t['split'], t['id']])[:24]   # mesma chave do notebook
         grupos.setdefault((t['dataset'], t['split']), []).append(t)
     assert len({t['key'] for t in tasks}) == len(tasks), 'IDs duplicados'
-    inv = pd.DataFrame(tasks).drop(columns=['prompt', 'referencia', 'testes'], errors='ignore')
+    inv = pd.DataFrame(tasks).drop(columns=['prompt', 'referencia', 'testes', 'correcoes_skeleton', 'imports'], errors='ignore')
     inv['tem_referencia'] = [bool(t.get('referencia')) for t in tasks]
     inv['faixa_ref'] = ''
     for _, frame in inv.groupby(['dataset', 'split'], sort=False):
