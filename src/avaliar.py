@@ -355,11 +355,16 @@ def main(argv=None):
             continue
         # cortada: até o fim da função/classe; inteira: até o primeiro token especial (EOS etc.)
         texto = s['corte']['texto'] if args.versao == 'cortada' else s['corte']['texto_inteira']
+        if args.versao == 'cortada' and t['dataset'] == 'ClassEval' and not s['corte']['ast_ok']:
+            texto = s['corte']['texto_inteira']   # mesmo fallback do corte novo, para rodadas antigas
         codigo = comum.codigo_avaliavel(t, texto)
+        metodos = comum.metodos_detectados(t, texto)
         itens.append(dict(dataset=t['dataset'], split=t['split'], id=t['id'], key=key, braco=braco,
                           amostra=-1 if amostra is None else amostra, codigo=codigo,
                           ast_ok=comum.compila(codigo), ast_ok_cortada=s['corte']['ast_ok'],
-                          ast_ok_inteira=s['corte']['ast_ok_inteira']))
+                          ast_ok_inteira=s['corte']['ast_ok_inteira'], resposta_vazia=not texto.strip(),
+                          n_metodos=None if metodos is None else len(metodos),
+                          metodos_detectados=None if metodos is None else ' '.join(metodos)))
 
     apps = [it for it in itens if it['dataset'] == 'APPS']
     if args.apps_subconjunto and apps:
@@ -409,7 +414,9 @@ def main(argv=None):
             resumo.append(dict(dataset=ds, split=sp, faixa_ref=faixa, braco=br, tarefas=len(g_),
                                respostas=len(resp), pass_at_1=g_['pass@1'].mean(),
                                ast_parse=resp.ast_ok.mean(), ast_parse_cortada=resp.ast_ok_cortada.mean(),
-                               ast_parse_inteira=resp.ast_ok_inteira.mean()))
+                               ast_parse_inteira=resp.ast_ok_inteira.mean(),
+                               resposta_vazia=resp.resposta_vazia.mean(),
+                               metodos_medio=resp.n_metodos.mean() if resp.n_metodos.notna().any() else None))
     resumo = pd.DataFrame(resumo)
     resumo.to_csv(destino / 'pass1.csv', index=False)
     with pd.option_context('display.width', 200, 'display.max_columns', 20):

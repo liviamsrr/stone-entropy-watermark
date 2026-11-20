@@ -594,6 +594,33 @@ def corte(task, ids, decode, especiais):
             elif len(prefixo) > pos:
                 break
     mantido = decode(ids[:manter])
+    ast_ok = compila(codigo_avaliavel(task, mantido))
+    ast_ok_inteira = compila(codigo_avaliavel(task, texto))
+    if task['dataset'] == 'ClassEval' and not ast_ok:
+        # skeleton + corte não compila: o cortador falhou; usa a resposta inteira
+        manter, motivo, mantido, ast_ok = k_esp, 'fallback_inteira', texto, ast_ok_inteira
     return dict(chars=pos, tokens=manter, motivo=motivo, texto=mantido, texto_inteira=texto,
-                ast_ok=compila(codigo_avaliavel(task, mantido)),
-                ast_ok_inteira=compila(codigo_avaliavel(task, texto)))
+                ast_ok=ast_ok, ast_ok_inteira=ast_ok_inteira,
+                vazia=not mantido.strip(), metodos_detectados=metodos_detectados(task, mantido))
+
+
+_DEF_NIVEL1 = re.compile(r'^(?:    |\t)(?:async[ \t]+)?def[ \t]+(\w+)', re.M)
+
+
+def metodos_detectados(task, texto):
+    """Métodos definidos pela resposta no corpo da classe (diagnóstico do ClassEval).
+    Com prompt + texto compilando, usa a AST (só defs escritos depois do prompt);
+    senão, procura `def` no nível 1 de indentação do texto."""
+    if task['dataset'] != 'ClassEval':
+        return None
+    if formato(task) == 'continuacao':
+        n_prompt = task['prompt'].count('\n')
+        try:
+            arvore = ast.parse(task['prompt'] + texto)
+            cls = next((n for n in arvore.body if isinstance(n, ast.ClassDef) and n.name == task['target']), None)
+            if cls is not None:
+                return [n.name for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and n.lineno > n_prompt]
+        except (SyntaxError, ValueError):
+            pass
+    return _DEF_NIVEL1.findall(texto)

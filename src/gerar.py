@@ -476,10 +476,12 @@ def main(argv=None):
                     s = generate(ctx, t, por_nome[nome], amostra, max_new[nome_ds[t['dataset']]])
                 write_gz(dest, s)
                 if s['status'] == 'ok':
-                    log.info('[%d/%d] %s/%s %s %-22s s%s %4d tokens %6.1fs parada=%s corte=%s ast=%s',
+                    met = s['corte'].get('metodos_detectados')
+                    log.info('[%d/%d] %s/%s %s %-22s s%s %4d tokens %6.1fs parada=%s corte=%s/%s ast=%s%s',
                              i, len(fila), t['dataset'], t['split'], t['id'], nome,
                              '-' if amostra is None else amostra, len(s['ids']), s['segundos'], s['stop'],
-                             s['corte']['tokens'], s['corte']['ast_ok'])
+                             s['corte']['tokens'], s['corte']['motivo'], s['corte']['ast_ok'],
+                             '' if met is None else f' métodos={met}')
                 else:
                     log.warning('[%d/%d] %s %s %s: %s', i, len(fila), t['dataset'], t['id'], nome, s['status'])
             except torch.OutOfMemoryError:
